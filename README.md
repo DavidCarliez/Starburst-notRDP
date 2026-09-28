@@ -12,6 +12,8 @@ Commands     : notrdp [start|shot|input|stop]
 Windows      : 10/11 (tested on Win11 25H2)
 ```
 
+![Hidden desktop captured via `notrdp shot`](docs/screenshot.png)
+
 ## How it works
 
 1. **`start`** — `CreateDesktopW(L"StarburstHidden")` with an explicit `SECURITY_ATTRIBUTES` (NULL DACL, so child processes and later agent instances can always open it), then launches `explorer.exe` and `cmd.exe /k` on that desktop via `STARTUPINFOW.lpDesktop`. Reports both PIDs in the task response.
